@@ -1,0 +1,1036 @@
+-- Final merged server script (GrabPart + SellPart per model) with Event-spawning + Collect Billboard
+-- Place this in ServerScriptService
+
+math.randomseed(tick())
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local Debris = game:GetService("Debris")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local MessagingService = game:GetService("MessagingService")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+
+-- ====== CONFIG ======
+local SPAWNER_NAME = "Spawner"
+local END_PART_NAME = "EndPart"
+local PLACE1_NAME = "Place1"
+
+local SPAWN_INTERVAL = 6
+local MOVE_SPEED = 9
+local PURCHASE_SPEED = 9
+local STEP_DT = 0.05
+local BILLBOARD_MAXDIST = 80
+
+local MAX_PARTS_PER_PLAYER = 8
+local ERROR_SOUNDID = "94135799095134"
+
+-- parts info (price/reward/chance)
+local PartsInfo = {
+    {Name="Red",    Price=25,    Reward=1,   Chance=90},
+    {Name="Black",  Price=7500,  Reward=450, Chance=0.8},
+    {Name="Green",  Price=100,   Reward=5,   Chance=60},
+    {Name="Orange", Price=1500,  Reward=100, Chance=3},
+    {Name="Sand",   Price=20000, Reward=1150, Chance=0.8},
+    {Name="SnowBlack",  Price=7500,  Reward=600,  Chance=0.6},
+    {Name="SnowSand",   Price=20000, Reward=1300, Chance=0.1},
+    {Name="CandyBlack", Price=7500,  Reward=550,  Chance=0.1},
+    {Name="CandySand",  Price=20000, Reward=1450, Chance=0.1},
+    {Name="BloodmoonBlack", Price=7500, Reward=850,  Chance=0.1},
+    {Name="BloodmoonSand",  Price=25000,Reward=2000, Chance=0.1},
+}
+local PartsMap = {}
+for _,p in ipairs(PartsInfo) do PartsMap[p.Name] = p end
+
+-- Event <-> template model lists (templates must be placed inside ReplicatedStorage)
+local EVENT_MODELS = {
+    bloodmoon = {"BloodmoonBlack","BloodmoonSand"},
+    snow = {"SnowBlack","SnowSand"},
+    candy = {"CandyBlack","CandySand"},
+    fog = {} -- fog has no spawn models
+}
+
+local EVENT_COLORS = {
+    bloodmoon = Color3.fromRGB(200,30,30),
+    snow = Color3.fromRGB(100,170,240),
+    candy = Color3.fromRGB(255,140,200),
+    fog = Color3.fromRGB(240,240,245)
+}
+
+-- Messaging topic used by GlobalEvent_Manager.lua (must match)
+local EVENT_TOPIC = "GlobalEvent_Manager_Topic_v1"
+
+-- ====== UTILITIES ======
+local function formatNumber(n)
+    if type(n) ~= "number" then return tostring(n) end
+    if n >= 1e9 then return string.format("%.1fB", n/1e9):gsub("%.0B","B") end
+    if n >= 1e6 then return string.format("%.1fM", n/1e6):gsub("%.0M","M") end
+    if n >= 1e3 then return string.format("%.1fK", n/1e3):gsub("%.0K","K") end
+    return tostring(n)
+end
+
+local function showTempMessage(player, text, color, soundId)
+    if not player then return end
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+    local gui = pg:FindFirstChild("CashSystem")
+    if not gui then
+        gui = Instance.new("ScreenGui")
+        gui.Name = "CashSystem"
+        gui.ResetOnSpawn = false
+        gui.Parent = pg
+    end
+    local folder = gui:FindFirstChild("PurchaseLabels")
+    if not folder then
+        folder = Instance.new("Folder")
+        folder.Name = "PurchaseLabels"
+        folder.Parent = gui
+    end
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.28,0,0.055,0)
+    label.Position = UDim2.new(0.36,0,0.78 - (#folder:GetChildren()*0.06),0)
+    label.BackgroundTransparency = 0.3
+    label.BackgroundColor3 = Color3.fromRGB(0,0,0)
+    label.TextColor3 = color or Color3.fromRGB(255,255,255)
+    label.TextScaled = true
+    label.Font = Enum.Font.GothamBold
+    label.Text = text
+    label.Parent = folder
+    label.TextTransparency = 1
+    if soundId then
+        local s = Instance.new("Sound", label)
+        s.SoundId = "rbxassetid://"..tostring(soundId)
+        pcall(function() s:Play() end)
+        Debris:AddItem(s, 2)
+    end
+    for i=1,0,-0.1 do
+        label.TextTransparency = i
+        task.wait(0.03)
+    end
+    task.wait(1)
+    for i=0,1,0.1 do
+        label.TextTransparency = i
+        task.wait(0.03)
+    end
+    label:Destroy()
+end
+
+-- ====== Workspace refs ======
+local Spawner = Workspace:FindFirstChild(SPAWNER_NAME)
+local EndPart = Workspace:FindFirstChild(END_PART_NAME)
+local Place1 = Workspace:FindFirstChild(PLACE1_NAME)
+if not Spawner then warn("Spawner not found: "..SPAWNER_NAME) end
+if not EndPart then warn("EndPart not found: "..END_PART_NAME) end
+if not Place1 then warn("Place1 not found: "..PLACE1_NAME) end
+
+-- Collect zones
+local CollectZones = {}
+for _,obj in ipairs(Workspace:GetChildren()) do
+    local cn = obj.Name:match("^CollectZone(%d+)$")
+    if cn and obj:IsA("BasePart") then CollectZones[tonumber(cn)] = obj end
+end
+
+local CollectZone1 = CollectZones[1] -- used by purchased movement
+if not CollectZone1 then warn("CollectZone1 not found!") end
+
+-- Stands & Collects
+local Stands = {}
+local Collects = {}
+if Place1 then
+    for i=1,MAX_PARTS_PER_PLAYER do
+        local s = Place1:FindFirstChild("Stand"..i)
+        if s then
+            if s:IsA("Model") and s.PrimaryPart then Stands[i] = s.PrimaryPart
+            elseif s:IsA("BasePart") then Stands[i] = s end
+        end
+        local c = Place1:FindFirstChild("Collect"..i)
+        if c and c:IsA("BasePart") then Collects[i] = c end
+    end
+end
+
+-- fallback create Collect parts
+for i=1,MAX_PARTS_PER_PLAYER do
+    if not Collects[i] then
+        local pos = Vector3.new(i*2,1,0)
+        if Stands[i] then pos = Stands[i].Position + Vector3.new(0,-2,0)
+        elseif #Stands > 0 then pos = Stands[1].Position + Vector3.new(i*2, -2, 0)
+        elseif Place1 and Place1:IsA("Model") and Place1.PrimaryPart then pos = Place1.PrimaryPart.Position + Vector3.new(i*2, -2, 0) end
+        local p = Instance.new("Part")
+        p.Name = "Collect"..i
+        p.Size = Vector3.new(2,0.6,2)
+        p.Position = pos
+        p.Anchored = true
+        p.CanCollide = false
+        p.Transparency = 1
+        p.Parent = Place1 or Workspace
+        Collects[i] = p
+    end
+end
+
+-- create billboard with 4 lines per Collect
+for i=1,MAX_PARTS_PER_PLAYER do
+    local collect = Collects[i]
+    if collect then
+        local bb = collect:FindFirstChild("EventBillboardGui")
+        if not bb then
+            bb = Instance.new("BillboardGui")
+            bb.Name = "EventBillboardGui"
+            bb.Size = UDim2.new(0,160,0,80)
+            bb.StudsOffset = Vector3.new(0,3,0)
+            bb.AlwaysOnTop = true
+            bb.Parent = collect
+            bb.MaxDistance = BILLBOARD_MAXDIST
+
+            -- Amount (top) - shows collect $amount
+            local amount = Instance.new("TextLabel")
+            amount.Name = "AmountLabel"
+            amount.Size = UDim2.new(1,0,0.25,0)
+            amount.Position = UDim2.new(0,0,0,0)
+            amount.BackgroundTransparency = 1
+            amount.TextScaled = true
+            amount.Font = Enum.Font.GothamBold
+            amount.TextColor3 = Color3.fromRGB(0,255,0)
+            amount.TextStrokeTransparency = 0
+            amount.Text = "Collect: $0"
+            amount.Parent = bb
+
+            -- Name
+            local nameL = Instance.new("TextLabel")
+            nameL.Name = "NameLabel"
+            nameL.Size = UDim2.new(1,0,0.25,0)
+            nameL.Position = UDim2.new(0,0,0.25,0)
+            nameL.BackgroundTransparency = 1
+            nameL.TextScaled = true
+            nameL.Font = Enum.Font.Gotham
+            nameL.TextColor3 = Color3.fromRGB(255,255,255)
+            nameL.Text = "Name: -"
+            nameL.Parent = bb
+
+            -- Reward/sec
+            local rewardL = Instance.new("TextLabel")
+            rewardL.Name = "RewardLabel"
+            rewardL.Size = UDim2.new(1,0,0.25,0)
+            rewardL.Position = UDim2.new(0,0,0.5,0)
+            rewardL.BackgroundTransparency = 1
+            rewardL.TextScaled = true
+            rewardL.Font = Enum.Font.Gotham
+            rewardL.TextColor3 = Color3.fromRGB(200,200,255)
+            rewardL.Text = "Reward/s: 0"
+            rewardL.Parent = bb
+
+            -- Price / Rarity
+            local infoL = Instance.new("TextLabel")
+            infoL.Name = "InfoLabel"
+            infoL.Size = UDim2.new(1,0,0.25,0)
+            infoL.Position = UDim2.new(0,0,0.75,0)
+            infoL.BackgroundTransparency = 1
+            infoL.TextScaled = true
+            infoL.Font = Enum.Font.Gotham
+            infoL.TextColor3 = Color3.fromRGB(255,220,120)
+            infoL.Text = "Price: - | Rarity: -"
+            infoL.Parent = bb
+        end
+    end
+end
+
+-- helper to update collect GUI for a specific stand index
+local function updateCollectGuiByIndex(index, partName, rewardPerSec, price, rarity, amount)
+    local collect = Collects[index]
+    if not collect then return end
+    local bb = collect:FindFirstChild("EventBillboardGui")
+    if not bb then return end
+    local amt = bb:FindFirstChild("AmountLabel")
+    local nm = bb:FindFirstChild("NameLabel")
+    local rew = bb:FindFirstChild("RewardLabel")
+    local info = bb:FindFirstChild("InfoLabel")
+    if amt then amt.Text = "Collect: $"..formatNumber(amount or 0) end
+    if nm then nm.Text = "Name: "..(partName or "-") end
+    if rew then rew.Text = "Reward/s: "..(rewardPerSec or 0) end
+    if info then info.Text = "Price: $"..(price or "-").." | Rarity: "..(rarity or "-") end
+end
+
+-- convenience: find collect index for a stand name like "Stand3"
+local function collectIndexForStandName(standName)
+    local idx = tonumber(standName:match("%d+"))
+    return idx
+end
+
+-- ====== helpers for choosing parts by chance (main spawn loop uses this) ======
+local function choosePartByChance()
+    local total = 0
+    for _,p in ipairs(PartsInfo) do total = total + (p.Chance or 0) end
+    if total <= 0 then return PartsInfo[1] end
+    local roll = math.random() * total
+    local sum = 0
+    for _,p in ipairs(PartsInfo) do
+        sum = sum + (p.Chance or 0)
+        if roll <= sum then return p end
+    end
+    return PartsInfo[1]
+end
+
+-- ====== Leaderstats & Cash GUI ======
+Players.PlayerAdded:Connect(function(player)
+    local stats = Instance.new("Folder")
+    stats.Name = "leaderstats"
+    stats.Parent = player
+
+    local cash = Instance.new("IntValue")
+    cash.Name = "Cash"
+    cash.Value = 75
+    cash.Parent = stats
+
+    local pg = player:WaitForChild("PlayerGui")
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "CashSystem"
+    gui.ResetOnSpawn = false
+    gui.Parent = pg
+
+    local cashLabel = Instance.new("TextLabel")
+    cashLabel.Name = "CashGui"
+    cashLabel.Size = UDim2.new(0.22,0,0.06,0)
+    cashLabel.Position = UDim2.new(0.01,0,0.92,0)
+    cashLabel.BackgroundTransparency = 0.3
+    cashLabel.BackgroundColor3 = Color3.fromRGB(0,0,0)
+    cashLabel.TextColor3 = Color3.fromRGB(0,255,0)
+    cashLabel.TextScaled = true
+    cashLabel.Font = Enum.Font.GothamBold
+    cashLabel.Text = "Cash: $"..formatNumber(cash.Value)
+    cashLabel.Parent = gui
+
+    local folder = Instance.new("Folder")
+    folder.Name = "PurchaseLabels"
+    folder.Parent = gui
+
+    cash.Changed:Connect(function(val)
+        if cashLabel and cashLabel.Parent then
+            cashLabel.Text = "Cash: $"..formatNumber(val)
+        end
+    end)
+end)
+
+-- ====== Stand logic (attach / detach / place / sell / collect) ======
+local StandData = {} -- standPart -> data
+local playerHolding = {}     -- player -> model
+local holdingConnections = {} -- model -> connection
+
+local function cleanupStand(standPart)
+    local data = StandData[standPart]
+    if not data then return end
+    if data.collectConn then pcall(function() data.collectConn:Disconnect() end) end
+    if data.standTouchConn then pcall(function() data.standTouchConn:Disconnect() end) end
+    if data.sellPrompt then pcall(function() data.sellPrompt:Destroy() end) end
+    if data.grabPrompt then pcall(function() data.grabPrompt:Destroy() end) end
+    if data.model and data.model.Parent then pcall(function() data.model:Destroy() end) end
+    if standPart:FindFirstChild("Occupied") then pcall(function() standPart:FindFirstChild("Occupied"):Destroy() end) end
+    local idx = standPart.Name:match("%d+")
+    local col = idx and Collects[tonumber(idx)]
+    if col then updateCollectGuiByIndex(tonumber(idx), "-", 0, "-", "-", 0) end
+    StandData[standPart] = nil
+end
+
+local function freeStandKeepModel(standPart)
+    if not standPart then return end
+    local data = StandData[standPart]
+    if not data then return end
+    data.alive = false
+    if data.collectConn then pcall(function() data.collectConn:Disconnect() end) end
+    if data.standTouchConn then pcall(function() data.standTouchConn:Disconnect() end) end
+    if data.sellPrompt then pcall(function() data.sellPrompt:Destroy() end) end
+    if data.grabPrompt then pcall(function() data.grabPrompt:Destroy() end) end
+    if standPart:FindFirstChild("Occupied") then pcall(function() standPart:FindFirstChild("Occupied"):Destroy() end) end
+    local idx = standPart.Name:match("%d+")
+    local col = idx and Collects[tonumber(idx)]
+    if col then updateCollectGuiByIndex(tonumber(idx), "-", 0, "-", "-", 0) end
+    StandData[standPart] = nil
+end
+
+local function getRandomFreeStand()
+    local pool = {}
+    for _,s in ipairs(Stands) do
+        if s and s:IsA("BasePart") and not s:FindFirstChild("Occupied") then table.insert(pool, s) end
+    end
+    if #pool == 0 then return nil end
+    return pool[math.random(1,#pool)]
+end
+
+local function getPlayerStandCount(player)
+    local count = 0
+    for _,data in pairs(StandData) do
+        if data.owner == player then count = count + 1 end
+    end
+    return count
+end
+
+-- ensure interaction parts
+local function ensureInteractionParts(model)
+    if not model then return nil,nil end
+    if not model.PrimaryPart then
+        model.PrimaryPart = model:FindFirstChildWhichIsA("BasePart")
+        if not model.PrimaryPart then return nil,nil end
+    end
+    local grabPart = model:FindFirstChild("GrabPart")
+    local sellPart = model:FindFirstChild("SellPart")
+    local baseCFrame = model.PrimaryPart.CFrame
+    if not grabPart or not grabPart:IsA("BasePart") then
+        grabPart = Instance.new("Part")
+        grabPart.Name = "GrabPart"
+        grabPart.Size = Vector3.new(1,1,1)
+        grabPart.Transparency = 1
+        grabPart.Anchored = true
+        grabPart.CanCollide = false
+        grabPart.CFrame = baseCFrame * CFrame.new(-1.2,0,0)
+        grabPart.Parent = model
+    end
+    if not sellPart or not sellPart:IsA("BasePart") then
+        sellPart = Instance.new("Part")
+        sellPart.Name = "SellPart"
+        sellPart.Size = Vector3.new(1,1,1)
+        sellPart.Transparency = 1
+        sellPart.Anchored = true
+        sellPart.CanCollide = false
+        sellPart.CFrame = baseCFrame * CFrame.new(1.2,0,0)
+        sellPart.Parent = model
+    end
+    return grabPart, sellPart
+end
+
+local function removeModelPrompts(model)
+    if not model then return end
+    for _,c in ipairs(model:GetDescendants()) do
+        if c:IsA("ProximityPrompt") then pcall(function() c:Destroy() end) end
+    end
+end
+
+-- attach model to player (carry)
+local function attachPartToPlayer(part, character, player)
+    if not part or not character or not player then return end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    if holdingConnections[part] then holdingConnections[part]:Disconnect(); holdingConnections[part] = nil end
+
+    local attachedNameValue = part:FindFirstChild("AttachedStandName")
+    if attachedNameValue then
+        local sname = attachedNameValue.Value
+        local standPart = Place1 and Place1:FindFirstChild(sname)
+        if standPart and standPart:IsA("BasePart") then freeStandKeepModel(standPart) end
+        pcall(function() attachedNameValue:Destroy() end)
+    end
+
+    for _,d in ipairs(part:GetDescendants()) do
+        if d:IsA("BasePart") then d.Anchored = true; d.CanCollide = false; d.Transparency = 0 end
+    end
+    part.Parent = Workspace
+
+    removeModelPrompts(part)
+
+    holdingConnections[part] = RunService.Heartbeat:Connect(function()
+        if not character.Parent or not hrp.Parent or not player.Parent then
+            if holdingConnections[part] then holdingConnections[part]:Disconnect() end
+            holdingConnections[part] = nil
+            playerHolding[player] = nil
+            return
+        end
+        local cf = hrp.CFrame * CFrame.new(0,1.1,-2)
+        if part.PrimaryPart then part:SetPrimaryPartCFrame(cf) else part.CFrame = cf end
+    end)
+
+    playerHolding[player] = part
+
+    -- show place prompts
+    for _, stand in ipairs(Stands) do
+        if stand and stand:IsA("BasePart") then
+            local pr = stand:FindFirstChild("PlacePrompt")
+            if pr then pr.Enabled = true end
+        end
+    end
+
+    -- Sell & Grab while carried
+    local grabPart, sellPart = ensureInteractionParts(part)
+    if sellPart and not sellPart:FindFirstChild("ModelSellPrompt") then
+        local sell = Instance.new("ProximityPrompt")
+        sell.Name = "ModelSellPrompt"
+        local priceVal = part:GetAttribute("Price") or 0
+        sell.ActionText = "Sell for $"..math.floor((priceVal or 0)/2)
+        sell.ObjectText = part:GetAttribute("PartName") or part.Name
+        sell.HoldDuration = 0.6
+        sell.Parent = sellPart
+        sell.Triggered:Connect(function(plr)
+            if plr ~= player then return end
+            if part:GetAttribute("PreventSell") then
+                showTempMessage(player, "This part cannot be sold.", Color3.fromRGB(255,80,80), ERROR_SOUNDID)
+                return
+            end
+            local ls = plr:FindFirstChild("leaderstats")
+            local cash = ls and ls:FindFirstChild("Cash")
+            local give = math.floor((part:GetAttribute("Price") or 0)/2)
+            if part:GetAttribute("CandyTinted") then give = give + (part:GetAttribute("CandyBonus") or 0) end
+            if cash and cash:IsA("IntValue") then cash.Value = cash.Value + give end
+            showTempMessage(player, "Part sold for $"..give, Color3.fromRGB(0,255,0), "3020841054")
+            if holdingConnections[part] then holdingConnections[part]:Disconnect(); holdingConnections[part] = nil end
+            playerHolding[player] = nil
+            pcall(function() part:Destroy() end)
+            for _, stand in ipairs(Stands) do local pr = stand:FindFirstChild("PlacePrompt"); if pr then pr.Enabled = false end end
+        end)
+    end
+
+    if grabPart and not grabPart:FindFirstChild("ModelGrabPrompt") then
+        local grab = Instance.new("ProximityPrompt")
+        grab.Name = "ModelGrabPrompt"
+        grab.ActionText = "Grab"
+        grab.ObjectText = part:GetAttribute("PartName") or part.Name
+        grab.HoldDuration = 0.3
+        grab.Parent = grabPart
+        grab.Triggered:Connect(function(plr)
+            if playerHolding[plr] then return end
+            attachPartToPlayer(part, plr.Character, plr)
+        end)
+    end
+end
+
+-- detach to stand helper
+local function detachPartToStand(part, standPart, player)
+    if not part or not standPart then return end
+
+    if standPart:FindFirstChild("Occupied") then pcall(function() standPart:FindFirstChild("Occupied"):Destroy() end) end
+    cleanupStand(standPart)
+
+    for _,d in ipairs(part:GetDescendants()) do if d:IsA("BasePart") then d.Anchored = true end end
+    local targetC = standPart.CFrame + Vector3.new(0,6,0)
+    if part.PrimaryPart then part:SetPrimaryPartCFrame(targetC) else part.CFrame = targetC end
+
+    local tag = Instance.new("BoolValue"); tag.Name = "Occupied"; tag.Parent = standPart
+    local attached = Instance.new("StringValue"); attached.Name = "AttachedStandName"; attached.Value = standPart.Name; attached.Parent = part
+    part:SetAttribute("OriginalStand", standPart.Name)
+
+    -- attributes
+    local partName = part:GetAttribute("PartName") or part.Name
+    local price = part:GetAttribute("Price") or 0
+    local reward = part:GetAttribute("Reward") or (PartsMap[partName] and PartsMap[partName].Reward or 0)
+
+    local data = {
+        amount = 0,
+        collectConn = nil,
+        standTouchConn = nil,
+        model = part,
+        owner = player,
+        sellPrompt = nil,
+        grabPrompt = nil,
+        tag = tag,
+        debounce = false,
+        alive = true
+    }
+    StandData[standPart] = data
+
+    -- generator
+    task.spawn(function()
+        while data.alive and data.model and data.model.Parent do
+            data.amount = data.amount + (reward or 0)
+            local idx = standPart.Name:match("%d+")
+            local collect = idx and Collects[tonumber(idx)]
+            if collect then updateCollectGuiByIndex(tonumber(idx), partName, reward, price, "N/A", data.amount) end
+            task.wait(1)
+        end
+    end)
+
+    local function tryCollect(pl)
+        if not pl or pl ~= player then return end
+        if data.amount <= 0 then return end
+        if data.debounce then return end
+        data.debounce = true
+        local ls = player:FindFirstChild("leaderstats")
+        local cash = ls and ls:FindFirstChild("Cash")
+        local payout = data.amount
+        if data.model and data.model:GetAttribute("CandyTinted") then payout = payout + (data.model:GetAttribute("CandyBonus") or 0) end
+        if cash and cash:IsA("IntValue") then
+            cash.Value = cash.Value + payout
+            showTempMessage(player, "+$"..payout, Color3.fromRGB(0,255,0), "3020841054")
+        end
+        data.amount = 0
+        local idx = standPart.Name:match("%d+")
+        if idx then updateCollectGuiByIndex(tonumber(idx), partName, reward, price, "N/A", 0) end
+        task.delay(0.5, function() data.debounce = false end)
+    end
+
+    -- collect touch
+    local idx = standPart.Name:match("%d+")
+    if idx then
+        local collect = Collects[tonumber(idx)]
+        if collect then
+            if data.collectConn then pcall(function() data.collectConn:Disconnect() end) end
+            data.collectConn = collect.Touched:Connect(function(hit)
+                local pl = Players:GetPlayerFromCharacter(hit.Parent)
+                tryCollect(pl)
+            end)
+        end
+    end
+
+    if standPart then
+        if data.standTouchConn then pcall(function() data.standTouchConn:Disconnect() end) end
+        data.standTouchConn = standPart.Touched:Connect(function(hit)
+            local pl = Players:GetPlayerFromCharacter(hit.Parent)
+            tryCollect(pl)
+        end)
+    end
+
+    -- interaction parts on stand-model
+    local grabPart, sellPart = ensureInteractionParts(part)
+
+    if sellPart then
+        local sellPrompt = Instance.new("ProximityPrompt")
+        sellPrompt.ActionText = "Sell for $"..math.floor(price/2)
+        sellPrompt.ObjectText = "Sell "..(partName or part.Name)
+        sellPrompt.HoldDuration = 0.6
+        sellPrompt.Parent = sellPart
+        data.sellPrompt = sellPrompt
+        sellPrompt.Triggered:Connect(function(plr)
+            if plr ~= player then return end
+            if part:GetAttribute("PreventSell") then
+                showTempMessage(player, "This part cannot be sold.", Color3.fromRGB(255,80,80), ERROR_SOUNDID)
+                return
+            end
+            local ls = player:FindFirstChild("leaderstats")
+            local cash = ls and ls:FindFirstChild("Cash")
+            local give = math.floor(price/2)
+            if part:GetAttribute("CandyTinted") then give = give + (part:GetAttribute("CandyBonus") or 0) end
+            if cash and cash:IsA("IntValue") then cash.Value = cash.Value + give end
+            data.alive = false
+            cleanupStand(standPart)
+            showTempMessage(player, "Part sold for $"..give, Color3.fromRGB(0,255,0), "3020841054")
+        end)
+    end
+
+    if grabPart then
+        local grabPrompt = Instance.new("ProximityPrompt")
+        grabPrompt.ActionText = "Grab"
+        grabPrompt.ObjectText = partName
+        grabPrompt.HoldDuration = 0.3
+        grabPrompt.Parent = grabPart
+        data.grabPrompt = grabPrompt
+        grabPrompt.Triggered:Connect(function(plr)
+            if plr ~= player then return end
+            if playerHolding[plr] then return end
+            if standPart:FindFirstChild("Occupied") then pcall(function() standPart:FindFirstChild("Occupied"):Destroy() end) end
+            if data.tag then pcall(function() data.tag:Destroy() end) end
+            data.tag = nil
+            freeStandKeepModel(standPart)
+            attachPartToPlayer(part, plr.Character, plr)
+        end)
+    end
+end
+
+local function detachPartFromPlayer(player, part, returnToStand, targetStand)
+    if not part then return end
+    if holdingConnections[part] then holdingConnections[part]:Disconnect(); holdingConnections[part] = nil end
+
+    for _, stand in ipairs(Stands) do local pr = stand:FindFirstChild("PlacePrompt"); if pr then pr.Enabled = false end end
+
+    if targetStand and targetStand:IsA("BasePart") then
+        detachPartToStand(part, targetStand, player)
+        playerHolding[player] = nil
+        return
+    end
+
+    if returnToStand then
+        local stand = getRandomFreeStand()
+        if stand then
+            detachPartToStand(part, stand, player)
+            playerHolding[player] = nil
+            return
+        end
+    end
+
+    for _,d in ipairs(part:GetDescendants()) do if d:IsA("BasePart") then d.Anchored = false; d.Transparency = 0; d.CanCollide = true end end
+    if player and player.Character and player.Character.PrimaryPart then
+        local dropPos = player.Character.PrimaryPart.CFrame * CFrame.new(0,0,-3)
+        if part.PrimaryPart then part:SetPrimaryPartCFrame(dropPos) else part.CFrame = dropPos end
+    end
+    playerHolding[player] = nil
+end
+
+local function attachToStand(model, partInfo, standPart, owner)
+    detachPartToStand(model, standPart, owner)
+end
+
+-- ====== Spawn / Purchase system (existing loop) ======
+local UnpurchasedQueue = {}
+local PurchasedList = {}
+local spawnCounter = 0
+
+-- EndPart touched: remove unpurchased that reach end
+if EndPart then
+    EndPart.Touched:Connect(function(hit)
+        if not hit then return end
+        local mdl = hit:FindFirstAncestorOfClass("Model") or hit.Parent
+        if not mdl then return end
+        for i=#UnpurchasedQueue,1,-1 do
+            local e = UnpurchasedQueue[i]
+            if e and e.model == mdl then
+                if e.model and e.model.Parent then pcall(function() e.model:Destroy() end) end
+                table.remove(UnpurchasedQueue, i)
+                return
+            end
+        end
+    end)
+end
+
+-- Unpurchased movement loop
+task.spawn(function()
+    while true do
+        local stepDist = MOVE_SPEED * STEP_DT
+        for i,entry in ipairs(UnpurchasedQueue) do
+            local model = entry.model
+            if not model or not model.Parent or not model.PrimaryPart then
+                UnpurchasedQueue[i] = nil
+            else
+                if EndPart then
+                    local cur = model.PrimaryPart.Position
+                    local dir = EndPart.Position - cur
+                    local dist = dir.Magnitude
+                    if dist > 0.001 then
+                        local move = dir.Unit * math.min(stepDist, dist)
+                        pcall(function() model:SetPrimaryPartCFrame(model.PrimaryPart.CFrame + move) end)
+                    end
+                    if dist <= 0.2 then
+                        pcall(function() model:Destroy() end)
+                        UnpurchasedQueue[i] = nil
+                    end
+                end
+            end
+        end
+        task.wait(STEP_DT)
+    end
+end)
+
+-- Purchased movement
+task.spawn(function()
+    while true do
+        local stepDist = PURCHASE_SPEED * STEP_DT
+        for i=#PurchasedList,1,-1 do
+            local entry = PurchasedList[i]
+            if not entry or not entry.model or not entry.model.PrimaryPart then
+                table.remove(PurchasedList, i)
+            else
+                if entry.phase == nil then entry.phase = "toCollect" end
+                if entry.phase == "toCollect" then
+                    if CollectZone1 then
+                        local targetPos = CollectZone1.Position + Vector3.new(0,2,0)
+                        local curPos = entry.model.PrimaryPart.Position
+                        local dir = targetPos - curPos
+                        local dist = dir.Magnitude
+                        if dist <= 0.2 then entry.phase = "toStand" else
+                            local move = dir.Unit * math.min(stepDist, dist)
+                            pcall(function() entry.model:SetPrimaryPartCFrame(entry.model.PrimaryPart.CFrame + move) end)
+                        end
+                    else
+                        entry.phase = "toStand"
+                    end
+                elseif entry.phase == "toStand" then
+                    local stand = getRandomFreeStand()
+                    if stand then
+                        pcall(function() entry.model:SetPrimaryPartCFrame(stand.CFrame + Vector3.new(0,6,0)) end)
+                        attachToStand(entry.model, entry.partInfo, stand, entry.owner)
+                        table.remove(PurchasedList, i)
+                    end
+                end
+            end
+        end
+        wait(STEP_DT)
+    end
+end)
+
+-- Spawn loop (unpurchased random parts)
+task.spawn(function()
+    while true do
+        local chosen = choosePartByChance()
+        local template = ReplicatedStorage:FindFirstChild(chosen.Name)
+        if template then
+            local clone
+            if template:IsA("Model") then
+                clone = template:Clone()
+            elseif template:IsA("BasePart") then
+                clone = Instance.new("Model")
+                local cp = template:Clone()
+                cp.Parent = clone
+                clone.PrimaryPart = cp
+            end
+            if clone then
+                clone.Parent = Workspace
+                if not clone.PrimaryPart then clone.PrimaryPart = clone:FindFirstChildWhichIsA("BasePart") end
+                if clone.PrimaryPart and Spawner then clone:SetPrimaryPartCFrame(Spawner.CFrame) end
+                for _,d in ipairs(clone:GetDescendants()) do if d:IsA("BasePart") then d.Anchored = false end end
+                local base = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart")
+                if base then
+                    ensureInteractionParts(clone)
+                    clone:SetAttribute("Price", chosen.Price or 0)
+                    clone:SetAttribute("PartName", chosen.Name or "")
+                    clone:SetAttribute("Reward", chosen.Reward or 0)
+                    spawnCounter = spawnCounter + 1
+                    local assignedIndex = ((spawnCounter - 1) % MAX_PARTS_PER_PLAYER) + 1
+                    local entry = { model = clone, partInfo = chosen, collectIndex = assignedIndex }
+                    table.insert(UnpurchasedQueue, entry)
+                    local prompt = Instance.new("ProximityPrompt")
+                    prompt.Name = "BuyPrompt"
+                    prompt.ActionText = "Buy $"..(chosen.Price or 0)
+                    prompt.ObjectText = chosen.Name
+                    prompt.HoldDuration = 0.6
+                    prompt.Parent = base
+                    prompt.Triggered:Connect(function(player)
+                        if getPlayerStandCount(player) >= MAX_PARTS_PER_PLAYER then
+                            showTempMessage(player, "Your Place Is Full Sell Parts!.", Color3.fromRGB(255,80,80), ERROR_SOUNDID)
+                            return
+                        end
+                        local idx = nil
+                        for i,e in ipairs(UnpurchasedQueue) do if e == entry then idx = i; break end end
+                        if not idx then return end
+                        local ls = player:FindFirstChild("leaderstats")
+                        local cash = ls and ls:FindFirstChild("Cash")
+                        if not (cash and cash:IsA("IntValue")) then return end
+                        if cash.Value < (chosen.Price or 0) then
+                            showTempMessage(player, "Not enough cash!", Color3.fromRGB(255,0,0), ERROR_SOUNDID)
+                            return
+                        end
+                        table.remove(UnpurchasedQueue, idx)
+                        cash.Value = cash.Value - (chosen.Price or 0)
+                        showTempMessage(player, "-$"..(chosen.Price or 0), Color3.fromRGB(255,0,0), "3020841054")
+                        pcall(function() prompt:Destroy() end)
+                        clone:SetAttribute("Price", chosen.Price or 0)
+                        clone:SetAttribute("PartName", chosen.Name or "")
+                        clone:SetAttribute("Reward", chosen.Reward or 0)
+                        local pEntry = { model = clone, partInfo = chosen, owner = player, speed = PURCHASE_SPEED, collectIndex = entry.collectIndex }
+                        table.insert(PurchasedList, pEntry)
+                    end)
+                else
+                    clone:Destroy()
+                end
+            end
+        end
+        task.wait(SPAWN_INTERVAL)
+    end
+end)
+
+-- Place prompts for stands
+for _, standPart in ipairs(Stands) do
+    if standPart and standPart:IsA("BasePart") then
+        if not standPart:FindFirstChild("PlacePrompt") then
+            local pr = Instance.new("ProximityPrompt")
+            pr.Name = "PlacePrompt"
+            pr.ActionText = "Place"
+            pr.ObjectText = standPart.Name
+            pr.HoldDuration = 0.35
+            pr.RequiresLineOfSight = false
+            pr.Enabled = false
+            pr.Parent = standPart
+            pr.Triggered:Connect(function(player)
+                local held = playerHolding[player]
+                if not held then
+                    showTempMessage(player, "You are not holding a part.", Color3.fromRGB(255,0,0), ERROR_SOUNDID)
+                    return
+                end
+                detachPartFromPlayer(player, held, false, standPart)
+            end)
+        end
+    end
+end
+
+-- Remote: PlacePartEvent (client can request to place by standName)
+local PLACE_EVENT_NAME = "PlacePartEvent"
+local placeEvent = ReplicatedStorage:FindFirstChild(PLACE_EVENT_NAME)
+if not placeEvent then
+    placeEvent = Instance.new("RemoteEvent")
+    placeEvent.Name = PLACE_EVENT_NAME
+    placeEvent.Parent = ReplicatedStorage
+end
+
+placeEvent.OnServerEvent:Connect(function(player, standName)
+    if not player then return end
+    local held = playerHolding[player]
+    if not held then showTempMessage(player, "You are not holding a part.", Color3.fromRGB(255,0,0), ERROR_SOUNDID); return end
+    if not standName or type(standName) ~= "string" then return end
+    local standPart = Place1 and Place1:FindFirstChild(standName)
+    if not standPart or not standPart:IsA("BasePart") then showTempMessage(player, "Invalid stand.", Color3.fromRGB(255,0,0), ERROR_SOUNDID); return end
+    detachPartFromPlayer(player, held, false, standPart)
+end)
+
+-- Player cleanup
+Players.PlayerAdded:Connect(function(player)
+    player.CharacterAdded:Connect(function(char) end)
+    player.CharacterRemoving:Connect(function()
+        local held = playerHolding[player]
+        if held and held.Parent then
+            local orig = held:GetAttribute("OriginalStand")
+            if orig then
+                local standPart = Place1 and Place1:FindFirstChild(orig)
+                if standPart and standPart:IsA("BasePart") then
+                    if holdingConnections[held] then holdingConnections[held]:Disconnect(); holdingConnections[held] = nil end
+                    playerHolding[player] = nil
+                    detachPartFromPlayer(player, held, false, standPart)
+                else
+                    if holdingConnections[held] then holdingConnections[held]:Disconnect(); holdingConnections[held] = nil end
+                    playerHolding[player] = nil
+                    if player.Character and player.Character.PrimaryPart then
+                        local dropPos = player.Character.PrimaryPart.CFrame * CFrame.new(0,0,-3)
+                        if held.PrimaryPart then held:SetPrimaryPartCFrame(dropPos) else held.CFrame = dropPos end
+                    end
+                end
+            else
+                if holdingConnections[held] then holdingConnections[held]:Disconnect(); holdingConnections[held] = nil end
+                playerHolding[player] = nil
+                if player.Character and player.Character.PrimaryPart then
+                    local dropPos = player.Character.PrimaryPart.CFrame * CFrame.new(0,0,-3)
+                    if held.PrimaryPart then held:SetPrimaryPartCFrame(dropPos) else held.CFrame = dropPos end
+                end
+            end
+        end
+    end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    for stand,data in pairs(StandData) do if data and data.owner == player then cleanupStand(stand) end end
+    for i=#PurchasedList,1,-1 do local e = PurchasedList[i]; if e and e.owner == player then if e.model and e.model.Parent then pcall(function() e.model:Destroy() end) end table.remove(PurchasedList,i) end end
+    local held = playerHolding[player]
+    if held then detachPartFromPlayer(player, held, true) end
+end)
+
+game:BindToClose(function()
+    for stand,_ in pairs(StandData) do cleanupStand(stand) end
+    for _,e in ipairs(UnpurchasedQueue) do if e.model and e.model.Parent then pcall(function() e.model:Destroy() end) end end
+    for _,e in ipairs(PurchasedList) do if e.model and e.model.Parent then pcall(function() e.model:Destroy() end) end end
+end)
+
+-- ====== Event-spawning integration (subscribe to GlobalEvent_Manager topic) ======
+-- Track spawned event models so we can remove them when event stops
+local EventSpawned = {} -- eventName -> { modelName -> instance }
+
+local function spawnEventModel(eventName, modelName)
+    if not ReplicatedStorage:FindFirstChild(modelName) then return nil end
+    -- don't spawn duplicate of same model for same event
+    EventSpawned[eventName] = EventSpawned[eventName] or {}
+    if EventSpawned[eventName][modelName] and EventSpawned[eventName][modelName].Parent then return EventSpawned[eventName][modelName] end
+
+    local tpl = ReplicatedStorage:FindFirstChild(modelName)
+    local clone = nil
+    if tpl:IsA("Model") then
+        clone = tpl:Clone()
+    elseif tpl:IsA("BasePart") then
+        clone = Instance.new("Model")
+        local cp = tpl:Clone()
+        cp.Parent = clone
+        clone.PrimaryPart = cp
+    end
+    if not clone then return nil end
+    clone.Parent = Workspace
+    if not clone.PrimaryPart then clone.PrimaryPart = clone:FindFirstChildWhichIsA("BasePart") end
+    if clone.PrimaryPart and Spawner then clone:SetPrimaryPartCFrame(Spawner.CFrame) end
+    for _,d in ipairs(clone:GetDescendants()) do if d:IsA("BasePart") then d.Anchored = false end end
+
+    -- set attributes (use PartsMap if exists)
+    local partInfo = PartsMap[modelName] or { Price = 0, Reward = 0 }
+    clone:SetAttribute("Price", partInfo.Price or 0)
+    clone:SetAttribute("PartName", modelName)
+    clone:SetAttribute("Reward", partInfo.Reward or 0)
+
+    -- tint to event color
+    local color = EVENT_COLORS[eventName]
+    if color then
+        for _,desc in ipairs(clone:GetDescendants()) do
+            if desc:IsA("BasePart") then
+                pcall(function() desc.Color = color end)
+            end
+        end
+    end
+
+    -- create buy prompt on main part
+    local base = clone.PrimaryPart or clone:FindFirstChildWhichIsA("BasePart")
+    if base then
+        local prompt = Instance.new("ProximityPrompt")
+        prompt.Name = "BuyPrompt"
+        prompt.ActionText = "Buy $"..(clone:GetAttribute("Price") or 0)
+        prompt.ObjectText = modelName
+        prompt.HoldDuration = 0.6
+        prompt.Parent = base
+
+        local entry = { model = clone, partInfo = { Name = modelName, Price = clone:GetAttribute("Price"), Reward = clone:GetAttribute("Reward") }, collectIndex = 1, eventName = eventName }
+        table.insert(UnpurchasedQueue, entry)
+
+        prompt.Triggered:Connect(function(player)
+            if getPlayerStandCount(player) >= MAX_PARTS_PER_PLAYER then
+                showTempMessage(player, "Your Place Is Full Sell Parts!.", Color3.fromRGB(255,80,80), ERROR_SOUNDID)
+                return
+            end
+            local idx = nil
+            for i,e in ipairs(UnpurchasedQueue) do if e == entry then idx = i; break end end
+            if not idx then return end
+            local ls = player:FindFirstChild("leaderstats")
+            local cash = ls and ls:FindFirstChild("Cash")
+            if not (cash and cash:IsA("IntValue")) then return end
+            local price = entry.partInfo.Price or 0
+            if cash.Value < price then showTempMessage(player, "Not enough cash!", Color3.fromRGB(255,0,0), ERROR_SOUNDID); return end
+            table.remove(UnpurchasedQueue, idx)
+            cash.Value = cash.Value - price
+            showTempMessage(player, "-$"..price, Color3.fromRGB(255,0,0), "3020841054")
+            pcall(function() prompt:Destroy() end)
+            clone:SetAttribute("Price", price)
+            clone:SetAttribute("PartName", modelName)
+            clone:SetAttribute("Reward", entry.partInfo.Reward or 0)
+            local pEntry = { model = clone, partInfo = entry.partInfo, owner = player, speed = PURCHASE_SPEED, collectIndex = entry.collectIndex }
+            table.insert(PurchasedList, pEntry)
+        end)
+    end
+
+    EventSpawned[eventName] = EventSpawned[eventName] or {}
+    EventSpawned[eventName][modelName] = clone
+    return clone
+end
+
+local function destroyEventModels(eventName)
+    if not EventSpawned[eventName] then return end
+    for modelName,inst in pairs(EventSpawned[eventName]) do
+        -- remove from UnpurchasedQueue if present
+        for i=#UnpurchasedQueue,1,-1 do
+            if UnpurchasedQueue[i] and UnpurchasedQueue[i].model == inst then
+                if inst and inst.Parent then pcall(function() inst:Destroy() end) end
+                table.remove(UnpurchasedQueue, i)
+            end
+        end
+        if inst and inst.Parent then pcall(function() inst:Destroy() end) end
+    end
+    EventSpawned[eventName] = nil
+end
+
+-- subscribe to MessagingService topic for events
+local function subscribeEventsTopic()
+    local ok, err = pcall(function()
+        MessagingService:SubscribeAsync(EVENT_TOPIC, function(message)
+            local data = message and message.Data
+            if type(data) == "string" then
+                local s, dec = pcall(function() return HttpService:JSONDecode(data) end)
+                if s then data = dec end
+            end
+            if type(data) ~= "table" then return end
+            local action = data.action
+            local name = data.name
+            local duration = data.duration
+            if action == "start" and name then
+                -- spawn event models once (one per template)
+                local models = EVENT_MODELS[name] or {}
+                for _,mname in ipairs(models) do
+                    spawnEventModel(name, mname)
+                end
+            elseif action == "stop" and name then
+                destroyEventModels(name)
+            elseif action == "allstop" then
+                for en,_ in pairs(EventSpawned) do destroyEventModels(en) end
+            end
+        end)
+    end)
+    if not ok then warn("[EventsSub] SubscribeAsync failed:", err) end
+end
+
+-- initialize
+subscribeEventsTopic()
+
+print("[MainServer] Loaded: grab/sell system + event-spawning + collect billboards.")
